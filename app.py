@@ -1,87 +1,104 @@
 from flask import Flask, request, Response
 from twilio.rest import Client
-from email_parser import parse_lead_email
-
-# -----------------------------
-# CONFIG — replace with your credentials
-# -----------------------------
-TWILIO_ACCOUNT_SID = "AC4679a7b2c777b4a010aecdba8e0bc0f2"
-TWILIO_AUTH_TOKEN  = "d2adce56cd8fd8727af845a6896d2160"
-TWILIO_NUMBER      = "+14156341194"      # Your Twilio number
-CONTRACTOR_PHONE   = "+2348112699123"
-
-client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+from twilio.twiml.voice_response import VoiceResponse
+import re
+import urllib.parse
+import os
 
 app = Flask(__name__)
 
-# -----------------------------
-# Route to receive a new lead (simulate email)
-# -----------------------------
+# --- ENV VARIABLES ---
+TWILIO_SID = os.getenv("AC4679a7b2c777b4a010aecdba8e0bc0f2")
+TWILIO_AUTH = os.getenv("d2adce56cd8fd8727af845a6896d2160")
+TWILIO_NUMBER = os.getenv("+14156341194")
+CONTRACTOR_NUMBER = os.getenv("+2348112699123")
+
+client = Client(TWILIO_SID, TWILIO_AUTH)
+
+
+# ---------------------------------------------
+#  HOME PAGE (optional)
+# ---------------------------------------------
+@app.route("/")
+def home():
+    return "Speed-to-Lead Bot is LIVE!"
+
+
+# ---------------------------------------------
+# 1) PARSE EMAIL + CALL CONTRACTOR
+# ---------------------------------------------
 @app.route("/call-contractor", methods=["POST"])
 def call_contractor():
-    # Get email text from POST request
-    email_text = request.form.get("email_text")
-    
-    name, phone = parse_lead_email(email_text)
 
-    if not phone:
-        return {"status": "error", "message": "No customer phone found"}, 400
+    email_text = request.form.get("email_text", "")
 
-    # Call contractor
-    contractor_call = client.calls.create(
-        to=CONTRACTOR_PHONE,
+    # --- Extract Name ---
+    name_match = re.search(r"Name[:\- ]+\s*(.+)", email_text, re.IGNORECASE)
+    name = name_match.group(1).strip() if name_match else "New Lead"
+
+    # --- Extract Phone ---
+    phone_match = re.search(r"Phone[:\- ]+\s*([\+\d]+)", email_text, re.IGNORECASE)
+    phone = phone_match.group(1).strip() if phone_match else ""
+
+    if phone == "":
+        return {"error": "No phone number found in email"}, 400
+
+    # --- Encode for URL safety ---
+    encoded_name = urllib.parse.quote(name)
+    encoded_phone = urllib.parse.quote(phone)
+
+    # --- Use your Railway domain (HTTPS only!) ---
+    base_url = "https://speed-to-lead-bot-production.up.railway.app"
+
+    voice_url = f"{base_url}/twilio-voice?name={encoded_name}&phone={encoded_phone}"
+
+    # --- Place call to contractor ---
+    call = client.calls.create(
+        to=CONTRACTOR_NUMBER,
         from_=TWILIO_NUMBER,
-        url=f"{request.url_root}twilio-voice?name={name}&phone={phone}"
+        url=voice_url
     )
 
-    return {"status": "calling", "lead_name": name, "lead_phone": phone}
+    return {"status": "calling", "sid": call.sid}
 
-# -----------------------------
-# Twilio voice instructions for contractor
-# -----------------------------
-@app.route("/twilio-voice", methods=["POST"])
+
+# ---------------------------------------------
+# 2) TWILIO CALL RESPONSE (TTS)
+# ---------------------------------------------
+@app.route("/twilio-voice", methods=["GET", "POST"])
 def twilio_voice():
-    name = request.args.get("name")
+
+    name = request.args.get("name", "New Lead")
     phone = request.args.get("phone")
 
-    response = f"""
-    <Response>
-        <Say voice="alice">New lead from {name}. Press 1 to call them now.</Say>
-        <Gather action="{request.url_root}call-customer?phone={phone}" numDigits="1" timeout="5"/>
-    </Response>
-    """
-    return Response(response, mimetype="text/xml")
+    vr = VoiceResponse()
 
-# -----------------------------
-# When contractor presses 1 → call customer
-# -----------------------------
-@app.route("/call-customer", methods=["POST"])
-def call_customer():
-    digit = request.form.get("Digits")
+    # Message the contractor hears
+    vr.say(f"You have a new lead from {name}. Press 1 to call them back now.")
+
+    with vr.gather(num_digits=1, action=f"/connect-customer?phone={phone}", method="POST") as g:
+        pass
+
+    return Response(str(vr), mimetype="text/xml")
+
+
+# ---------------------------------------------
+# 3) CONNECT CONTRACTOR → CUSTOMER
+# ---------------------------------------------
+@app.route("/connect-customer", methods=["POST"])
+def connect_customer():
+
     phone = request.args.get("phone")
 
-    if digit == "1":
-        client.calls.create(
-            to=phone,
-            from_=TWILIO_NUMBER,
-            url=f"{request.url_root}connect"
-        )
+    vr = VoiceResponse()
+    vr.say("Connecting you to the customer now.")
+    vr.dial(phone)
 
-    return "<Response><Say>Done.</Say></Response>"
+    return Response(str(vr), mimetype="text/xml")
 
-# -----------------------------
-# Connecting contractor and customer
-# -----------------------------
-@app.route("/connect", methods=["POST"])
-def connect():
-    return """
-    <Response>
-        <Say voice="alice">Connecting you now.</Say>
-    </Response>
-    """
 
-# -----------------------------
-# Run app
-# -----------------------------
+# ---------------------------------------------
+# RUN FLASK ON RAILWAY
+# ---------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
